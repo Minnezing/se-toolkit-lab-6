@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Agent CLI - Documentation agent with tools and agentic loop.
+"""Agent CLI - System agent with tools (read_file, list_files, query_api) and agentic loop.
 
 Usage:
     uv run agent.py "Your question here"
@@ -10,6 +10,7 @@ Output:
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,11 +25,25 @@ class AgentSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env.agent.secret",
         env_file_encoding="utf-8",
+        extra="ignore",
     )
 
     llm_api_key: str
     llm_api_base: str
     llm_model: str = "qwen3-coder-plus"
+
+
+class BackendSettings(BaseSettings):
+    """Load backend API configuration from environment."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env.docker.secret",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    lms_api_key: str = ""
+    agent_api_base_url: str = "http://localhost:42002"
 
 
 # Project root for path security
@@ -115,6 +130,55 @@ def list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
+def query_api(method: str, path: str, body: str | None = None, auth: bool = True) -> str:
+    """Query the backend LMS API.
+
+    Args:
+        method: HTTP method (GET, POST, etc.).
+        path: API endpoint path (e.g., '/items/').
+        body: Optional JSON request body for POST/PUT.
+        auth: Whether to include authentication header (default True).
+
+    Returns:
+        JSON string with status_code and body, or error message.
+    """
+    try:
+        # Load backend settings
+        backend_settings = BackendSettings()
+        base_url = backend_settings.agent_api_base_url
+        api_key = backend_settings.lms_api_key
+
+        url = f"{base_url}{path}"
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if auth:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        print(f"  [query_api] {method} {url} (auth={auth})", file=sys.stderr)
+
+        with httpx.Client(timeout=30.0) as client:
+            if method.upper() == "GET":
+                response = client.get(url, headers=headers)
+            elif method.upper() == "POST":
+                data = json.loads(body) if body else {}
+                response = client.post(url, headers=headers, json=data)
+            else:
+                return f"Error: Unsupported method: {method}"
+
+        result = json.dumps({
+            "status_code": response.status_code,
+            "body": response.text,
+        })
+        print(f"  [query_api] Status: {response.status_code}", file=sys.stderr)
+        return result
+
+    except Exception as e:
+        error_msg = f"Error querying API: {e}"
+        print(f"  [query_api] {error_msg}", file=sys.stderr)
+        return error_msg
+
+
 # Tool definitions for LLM function calling
 TOOLS = [
     {
@@ -150,6 +214,35 @@ TOOLS = [
                 "required": ["path"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Query the backend LMS API. Use for questions about data (item count, scores, analytics) or system behavior (status codes, errors). Do NOT use for wiki/documentation questions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method (GET, POST, etc.)"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API endpoint path (e.g., '/items/', '/analytics/completion-rate')"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON request body for POST/PUT requests"
+                    },
+                    "auth": {
+                        "type": "boolean",
+                        "description": "Whether to include authentication header (default true). Set to false to test unauthenticated access."
+                    }
+                },
+                "required": ["method", "path"]
+            }
+        }
     }
 ]
 
@@ -157,23 +250,54 @@ TOOLS = [
 TOOL_FUNCTIONS = {
     "read_file": read_file,
     "list_files": list_files,
+    "query_api": query_api,
 }
 
-SYSTEM_PROMPT = """You are a documentation assistant. You have access to two tools:
+SYSTEM_PROMPT = """You are a documentation and system assistant. You have access to three tools:
 - list_files: List files in a directory
-- read_file: Read contents of a file
+- read_file: Read contents of a file  
+- query_api: Query the backend LMS API
+
+Tool selection guide:
+- For questions about documentation/workflows: use list_files and read_file on wiki/
+- For questions about source code (what framework, how it works): use read_file on relevant files
+- For questions about running data (item count, scores, analytics): use query_api
+- For questions about system behavior (status codes, errors): use query_api
+
+Project structure reference:
+- Wiki files: wiki/*.md
+- Backend code: backend/app/ (main.py, routers/, models/, etc.)
+- Routers: backend/app/routers/ (items.py, analytics.py, interactions.py, learners.py, pipeline.py)
+- Config: pyproject.toml, docker-compose.yml
 
 When answering questions:
-1. First use list_files to find relevant documentation files (e.g., path: "wiki")
-2. Use read_file to read specific files (e.g., path: "wiki/git-workflow.md")
-3. Find the exact section that answers the question
-4. Include the source as "path/to/file.md#section-anchor" format
-5. Only give final answer after gathering enough information
+1. Choose the right tool based on the question type
+2. For wiki questions: use list_files to discover, then read_file to find answers
+3. For API questions: use query_api with GET method and the endpoint path
+4. For source code questions: read the relevant file directly
+5. For bug diagnosis: 
+   - First use query_api to reproduce the error
+   - Then ALWAYS use read_file to read the source code and find the root cause
+   - Explain the bug and reference the specific line number
+6. Find the exact section that answers the question
+7. Include the source as "path/to/file.md#section-anchor" format for wiki/source/bug questions
+8. Only give final answer after gathering enough information
 
-IMPORTANT: All paths must include the directory prefix. For wiki files, use "wiki/filename.md" not just "filename.md".
+IMPORTANT: 
+- All file paths must include the directory prefix (e.g., "wiki/git.md" not just "git.md")
+- For backend files, use "backend/app/filename.py" or "backend/app/routers/filename.py"
+- For API queries, use paths like "/items/", "/analytics/completion-rate", etc.
+- For analytics endpoints, always include the lab parameter (e.g., /analytics/top-learners?lab=lab-01)
+- Source is OPTIONAL for API/system questions but REQUIRED for wiki/source/bug questions
+- Be concise and direct in your final answer
+- State the answer clearly in the first sentence
+- Avoid calling the same tool twice with the same arguments
+- ALWAYS include the source field when answering wiki or source code questions
+- To test unauthenticated access, use query_api with auth=false
+- For bug diagnosis, query the API to reproduce the error, then read the source to find the root cause
 
-If you don't find the answer in the documentation, say so honestly.
-Always include the source reference in your final answer."""
+If you don't find the answer, say so honestly.
+For wiki/source questions, always include the source reference in your final answer."""
 
 
 def execute_tool(tool_name: str, args: dict[str, Any]) -> str:
@@ -272,10 +396,11 @@ def run_agentic_loop(question: str, settings: AgentSettings) -> dict[str, Any]:
             print(f"Final answer received.", file=sys.stderr)
             answer = assistant_message.get("content", "")
 
-            # Extract source from answer if possible (look for file.md#anchor pattern)
+            # Extract source from answer if possible (look for file.md#anchor or file.py#line pattern)
             source = ""
             import re
-            source_match = re.search(r'(\w+/[\w-]+\.md(?:#[\w-]+)?)', answer)
+            # Match patterns like: wiki/git.md, backend/app/main.py, wiki/git.md#section, backend/app/main.py#L10
+            source_match = re.search(r'((?:wiki|backend)/[\w./-]+\.(?:md|py)(?:#[\w-]+)?)', answer)
             if source_match:
                 source = source_match.group(1)
 
