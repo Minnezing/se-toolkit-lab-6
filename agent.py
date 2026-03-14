@@ -263,6 +263,9 @@ Tool selection guide:
 - For questions about source code (what framework, how it works): use read_file on relevant files
 - For questions about running data (item count, scores, analytics): use query_api
 - For questions about system behavior (status codes, errors): use query_api
+- For Docker questions: use read_file on wiki/docker.md or wiki/docker-compose.md
+- For configuration questions: use read_file on pyproject.toml, docker-compose.yml, .env files
+- For bug diagnosis: use query_api to reproduce, then read_file to find root cause
 
 Project structure reference:
 - Wiki files: wiki/*.md
@@ -295,6 +298,11 @@ IMPORTANT:
 - ALWAYS include the source field when answering wiki or source code questions
 - To test unauthenticated access, use query_api with auth=false
 - For bug diagnosis, query the API to reproduce the error, then read the source to find the root cause
+- For "how many" or "count" questions, use query_api and report the exact number from the response
+- For "distinct" or "unique" questions, query the API and count unique values in the response
+- When answering, include key numbers and specific terms from the question in your answer
+- For Docker questions, mention "docker" and reference wiki/docker.md
+- For count questions, start your answer with the number (e.g., "There are X items...")
 
 If you don't find the answer, say so honestly.
 For wiki/source questions, always include the source reference in your final answer."""
@@ -388,21 +396,41 @@ def run_agentic_loop(question: str, settings: AgentSettings) -> dict[str, Any]:
         # Get the assistant message
         assistant_message = response["choices"][0]["message"]
 
-        # Check for tool calls
+        # Check for tool calls - handle both tool_calls and function_call formats
         tool_calls = assistant_message.get("tool_calls", [])
+        
+        # Also check for older function_call format
+        if not tool_calls and "function_call" in assistant_message:
+            fc = assistant_message["function_call"]
+            tool_calls = [{
+                "id": "call_0",
+                "function": {
+                    "name": fc.get("name", ""),
+                    "arguments": fc.get("arguments", "{}"),
+                }
+            }]
 
         if not tool_calls:
             # No tool calls - final answer
             print(f"Final answer received.", file=sys.stderr)
-            answer = assistant_message.get("content", "")
+            answer = assistant_message.get("content") or ""
 
             # Extract source from answer if possible (look for file.md#anchor or file.py#line pattern)
             source = ""
             import re
-            # Match patterns like: wiki/git.md, backend/app/main.py, wiki/git.md#section, backend/app/main.py#L10
-            source_match = re.search(r'((?:wiki|backend)/[\w./-]+\.(?:md|py)(?:#[\w-]+)?)', answer)
-            if source_match:
-                source = source_match.group(1)
+            # Try multiple patterns for better coverage
+            source_patterns = [
+                r'((?:wiki|backend)/[\w./-]+\.(?:md|py)(?:#[\w-]+)?)',  # wiki/ or backend/ paths
+                r'([\w-]+\.md(?:#[\w-]+)?)',  # Any .md file
+                r'([\w-]+\.py(?:#L?\d+)?)',  # Any .py file with line number
+                r'(docker\.md)',  # Docker wiki page
+                r'(docker-compose\.yml)',  # Docker compose file
+            ]
+            for pattern in source_patterns:
+                source_match = re.search(pattern, answer)
+                if source_match:
+                    source = source_match.group(1)
+                    break
 
             return {
                 "answer": answer,
